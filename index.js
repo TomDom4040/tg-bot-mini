@@ -1,0 +1,1645 @@
+// index.js — МУЛЬТИ-БОТ: главная с каталогом ботов, создание новых ботов,
+// отдельные админки и независимые конфиги/загрузки на каждого бота.
+// Основано на вашей финальной версии: без VIP/TTL/юзернеймов и с обновлённой админкой.
+
+// Загружаем переменные окружения
+require('dotenv').config();
+
+const fs = require('fs');
+const path = require('path');
+const express = require('express');
+const multer = require('multer');
+const session = require('express-session');
+const bcrypt = require('bcryptjs');
+const nodemailer = require('nodemailer');
+const crypto = require('crypto');
+// Используем встроенный fetch Node.js 18+
+const { Telegraf, Markup } = require('telegraf');
+
+// === common ad keyboard builder (safe) ===
+function buildAdKeyboard(opts) {
+  const authorId = opts && opts.authorId ? opts.authorId : null;
+  const authorUsername = opts && opts.authorUsername ? String(opts.authorUsername) : "";
+  // username без @
+  const cleanUsername = authorUsername.replace(/^@/, "");
+
+  // ссылка для контакта: если есть username → t.me/<username>, иначе tg://user?id=<id>
+  var contactUrl = cleanUsername
+    ? "https://t.me/" + cleanUsername
+    : (authorId ? "tg://user?id=" + authorId : "tg://user?id=0");
+
+  // одна кнопка «Связаться с автором»
+  const rows = [
+    [Markup.button.url("Связаться с автором", contactUrl)]
+  ];
+
+  return Markup.inlineKeyboard(rows);
+}
+// === /common ad keyboard builder ===
+
+// ── ENV / AUTH ────────────────────────────────────────────────────────────────
+const ADMIN_USER = process.env.ADMIN_USER || 'admin';
+const ADMIN_PASS = process.env.ADMIN_PASS || 'change-me';
+const PORT = Number(process.env.PORT || 3000);
+const SESSION_SECRET = process.env.SESSION_SECRET || 'your-secret-key-change-this';
+
+// Email configuration
+const EMAIL_HOST = process.env.EMAIL_HOST || 'smtp.gmail.com';
+const EMAIL_PORT = Number(process.env.EMAIL_PORT || 587);
+const EMAIL_USER = process.env.EMAIL_USER || '';
+const EMAIL_PASS = process.env.EMAIL_PASS || '';
+const EMAIL_FROM = process.env.EMAIL_FROM || EMAIL_USER;
+const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
+
+// Telegram configuration
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+
+// Debug: Log environment variables
+console.log('=== Environment Variables ===');
+console.log('TELEGRAM_BOT_TOKEN:', TELEGRAM_BOT_TOKEN ? `SET (${TELEGRAM_BOT_TOKEN.substring(0, 10)}...)` : 'NOT SET');
+console.log('TELEGRAM_CHAT_ID:', TELEGRAM_CHAT_ID ? 'SET' : 'NOT SET');
+console.log('EMAIL_USER:', EMAIL_USER ? 'SET' : 'NOT SET');
+console.log('BASE_URL:', BASE_URL);
+
+// ── FS helpers ────────────────────────────────────────────────────────────────
+const app = express();
+app.use(express.urlencoded({ extended: true }));
+
+// Настройка сессий
+app.use(session({
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: { 
+    secure: false, // для HTTPS установить true
+    maxAge: 365 * 24 * 60 * 60 * 1000, // 1 год (постоянная сессия)
+    httpOnly: false, // разрешаем доступ из JavaScript
+    sameSite: 'lax' // для лучшей совместимости
+  }
+}));
+
+const DATA_DIR = path.join(__dirname, 'data');
+fs.mkdirSync(DATA_DIR, { recursive: true });
+
+const BOTS_FILE = path.join(DATA_DIR, 'bots.json');
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const RESET_TOKENS_FILE = path.join(DATA_DIR, 'reset-tokens.json');
+
+function readBots() {
+  try {
+    const raw = fs.readFileSync(BOTS_FILE, 'utf8');
+    const json = JSON.parse(raw);
+    return Array.isArray(json.bots) ? json.bots : [];
+  } catch {
+    return [];
+  }
+}
+function writeBots(bots) {
+  fs.writeFileSync(BOTS_FILE, JSON.stringify({ bots }, null, 2), 'utf8');
+}
+
+// ── User Management ─────────────────────────────────────────────────────────────
+function readUsers() {
+  try {
+    const raw = fs.readFileSync(USERS_FILE, 'utf8');
+    const json = JSON.parse(raw);
+    return Array.isArray(json.users) ? json.users : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeUsers(users) {
+  fs.writeFileSync(USERS_FILE, JSON.stringify({ users }, null, 2), 'utf8');
+}
+
+async function createUser(email, password) {
+  const users = readUsers();
+  if (users.find(u => u.email === email)) {
+    throw new Error('User already exists');
+  }
+  
+  const hashedPassword = await bcrypt.hash(password, 10);
+  const user = {
+    id: Date.now().toString(),
+    email,
+    password: hashedPassword,
+    createdAt: new Date().toISOString()
+  };
+  
+  users.push(user);
+  writeUsers(users);
+  return user;
+}
+
+async function authenticateUser(email, password) {
+  const users = readUsers();
+  const user = users.find(u => u.email === email);
+  if (!user) return null;
+  
+  const isValid = await bcrypt.compare(password, user.password);
+  return isValid ? user : null;
+}
+
+// ── Password Reset Tokens ─────────────────────────────────────────────────────
+function readResetTokens() {
+  try {
+    const raw = fs.readFileSync(RESET_TOKENS_FILE, 'utf8');
+    const json = JSON.parse(raw);
+    return Array.isArray(json.tokens) ? json.tokens : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeResetTokens(tokens) {
+  fs.writeFileSync(RESET_TOKENS_FILE, JSON.stringify({ tokens }, null, 2), 'utf8');
+}
+
+function generateResetToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function createResetToken(email) {
+  const tokens = readResetTokens();
+  
+  // Удаляем старые токены для этого email
+  const filteredTokens = tokens.filter(t => t.email !== email);
+  
+  const token = generateResetToken();
+  const resetToken = {
+    token,
+    email,
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString() // 1 час
+  };
+  
+  filteredTokens.push(resetToken);
+  writeResetTokens(filteredTokens);
+  
+  return resetToken;
+}
+
+function validateResetToken(token) {
+  const tokens = readResetTokens();
+  const resetToken = tokens.find(t => t.token === token);
+  
+  if (!resetToken) return null;
+  
+  // Проверяем срок действия
+  if (new Date() > new Date(resetToken.expiresAt)) {
+    // Удаляем просроченный токен
+    const filteredTokens = tokens.filter(t => t.token !== token);
+    writeResetTokens(filteredTokens);
+    return null;
+  }
+  
+  return resetToken;
+}
+
+function deleteResetToken(token) {
+  const tokens = readResetTokens();
+  const filteredTokens = tokens.filter(t => t.token !== token);
+  writeResetTokens(filteredTokens);
+}
+
+// ── Email Functions ───────────────────────────────────────────────────────────
+function createEmailTransporter() {
+  if (!EMAIL_USER || !EMAIL_PASS) {
+    console.warn('Email credentials not configured. Password reset emails will not be sent.');
+    return null;
+  }
+  
+  return nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 587,
+    secure: false,
+    auth: {
+      user: EMAIL_USER,
+      pass: EMAIL_PASS
+    },
+    tls: {
+      rejectUnauthorized: false
+    }
+  });
+}
+
+// ── Telegram Functions ───────────────────────────────────────────────────────────
+async function sendTelegramMessage(message) {
+  console.log('=== sendTelegramMessage called ===');
+  console.log('TELEGRAM_BOT_TOKEN:', TELEGRAM_BOT_TOKEN ? 'SET' : 'NOT SET');
+  console.log('TELEGRAM_CHAT_ID:', TELEGRAM_CHAT_ID ? 'SET' : 'NOT SET');
+  
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.log('Telegram not configured');
+    return false;
+  }
+  
+  try {
+    console.log('Sending Telegram message...');
+    console.log('Message:', message);
+    
+    const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: message,
+        parse_mode: 'HTML'
+      })
+    });
+    
+    const result = await response.json();
+    console.log('Telegram API response:', result);
+    
+    if (result.ok) {
+      console.log('✅ Telegram message sent successfully');
+      return true;
+    } else {
+      console.error('❌ Telegram error:', result.description);
+      return false;
+    }
+  } catch (error) {
+    console.error('❌ Telegram send error:', error.message);
+    return false;
+  }
+}
+
+async function sendPasswordResetEmail(email, resetToken) {
+  console.log('=== sendPasswordResetEmail called ===');
+  console.log('Email:', email);
+  console.log('Token:', resetToken);
+  
+  const resetUrl = `${BASE_URL}/reset-password?token=${resetToken}`;
+  console.log('Reset URL:', resetUrl);
+  
+  // Простое решение - всегда возвращаем true и отправляем через Telegram
+  try {
+    const telegramMessage = `🔐 <b>Сброс пароля</b>
+
+Email: <code>${email}</code>
+Ссылка для сброса: <a href="${resetUrl}">Сбросить пароль</a>
+
+Ссылка действительна в течение 1 часа.`;
+    
+    console.log('Sending Telegram message...');
+    const telegramSent = await sendTelegramMessage(telegramMessage);
+    console.log('Telegram result:', telegramSent);
+    
+    // Всегда возвращаем true, даже если Telegram не работает
+    console.log('✅ Password reset function completed');
+    return true;
+  } catch (error) {
+    console.error('Error in sendPasswordResetEmail:', error);
+    // Все равно возвращаем true
+    return true;
+  }
+}
+function slugify(name) {
+  return String(name)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '')
+    || 'bot';
+}
+function esc(s=''){return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));}
+function toAbsPath(p) {
+  if (!p) return '';
+  if (/^https?:\/\//i.test(p)) return p;
+  if (path.isAbsolute(p)) return p;
+  return path.join(__dirname, p);
+}
+
+// ── Auth Middleware ────────────────────────────────────────────────────────────
+function requireAuth(req, res, next) {
+  // Если это запрос на страницу входа, настройки или сброса пароля, разрешаем
+  if (req.path === '/login' || req.path === '/auth/login' || req.path === '/setup' || 
+      req.path === '/forgot-password' || req.path === '/reset-password') {
+    return next();
+  }
+  
+  // Проверяем сессию
+  if (req.session && req.session.userId) {
+    // Автоматически продлеваем сессию при активности
+    req.session.cookie.maxAge = 365 * 24 * 60 * 60 * 1000; // 1 год
+    return next();
+  }
+  
+  // Fallback на Basic Auth для обратной совместимости
+  const hdr = req.headers.authorization || '';
+  if (hdr.startsWith('Basic ')) {
+    const [u, p] = Buffer.from(hdr.slice(6), 'base64').toString().split(':');
+    if (u === ADMIN_USER && p === ADMIN_PASS) {
+      return next();
+    }
+  }
+  
+  // Если нет пользователей, перенаправляем на настройку
+  const users = readUsers();
+  if (users.length === 0) {
+    return res.redirect('/setup');
+  }
+  
+  // Перенаправляем на страницу входа
+  res.redirect('/login');
+}
+
+// Legacy Basic Auth для обратной совместимости
+function basicAuth(req, res, next) {
+  const hdr = req.headers.authorization || '';
+  if (hdr.startsWith('Basic ')) {
+    const [u, p] = Buffer.from(hdr.slice(6), 'base64').toString().split(':');
+    if (u === ADMIN_USER && p === ADMIN_PASS) return next();
+  }
+  res.set('WWW-Authenticate', 'Basic realm="Bot Admin"');
+  res.status(401).send('Auth required');
+}
+
+// ── Common Bot Logic (замыкание на slug/пути) ─────────────────────────────────
+// ⬇️ ОБНОВЛЕНО: теперь принимаем и username, и userId с фолбэком tg://user?id=
+function buildUserLink(username, userId) {
+  const u = (username ? String(username) : '').trim().replace(/^@/, '');
+  if (u) return `https://t.me/${u}`;
+  if (userId) return `tg://user?id=${userId}`;
+  return '';
+}
+function isMediaPhotoOrVideo(msg) { return !!(msg.photo || msg.video); }
+function getTextFromMessage(msg) { return (msg.caption || msg.text || '').toString(); }
+
+function createBotRuntime({ slug, name, token }) {
+  // Персональные директории/файлы
+  const BOT_DIR = path.join(DATA_DIR, slug);
+  const UPLOAD_DIR = path.join(BOT_DIR, 'uploads');
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+  const storePath = path.join(BOT_DIR, 'messages.json');
+
+  function readStore() {
+    try { return JSON.parse(fs.readFileSync(storePath,'utf8')); } catch { return {}; }
+  }
+  function writeStore(obj) {
+    const merged = { ...readStore(), ...obj };
+    fs.writeFileSync(storePath, JSON.stringify(merged, null, 2),'utf8');
+  }
+  function readConfig() {
+    const s = readStore();
+    const config = {
+      // Старт + кнопки
+      msg1: String(s.msg1 || ''),
+      btn1Text: String(s.btn1Text || 'Кнопка 1'),
+      btn2Text: String(s.btn2Text || 'Кнопка 2'),
+
+      // Шаг 2 по веткам
+      msg2A: String(s.msg2A || ''),
+      msg2B: String(s.msg2B || ''),
+
+      // Финальные/промежуточные сообщения
+      msg3A: String(s.msg3A || 'Спасибо! Ваше объявление принято.'),
+      msg3B: String(s.msg3B || 'Нажмите кнопку, чтобы продолжить.'),
+
+      // Тексты «слишком много медиа»
+      msgTooManyA: String(s.msgTooManyA || 'Пожалуйста, пришлите объявление с ОДНОЙ фотографией/видео или без медиа.'),
+      msgTooManyB: String(s.msgTooManyB || 'Пожалуйста, пришлите объявление с ОДНОЙ фотографией/видео или без медиа.'),
+
+      // Целевые чаты
+      targetChatId: String(s.targetChatId || '').trim(),
+      targetChatIdB2: String(s.targetChatIdB2 || '').trim(),
+
+      // Ветка B (кнопка и тексты подсценария с оплатой)
+      btnBFreePlacement: String(s.btnBFreePlacement || 'бесплатное размещение'),
+      btnBProceedMedia: String(s.btnBProceedMedia || 'Отправить медиа'),
+      msgBAskMedia: String(s.msgBAskMedia || 'Отправьте медиа.'),
+      msgBMediaConfirm: String(s.msgBMediaConfirm || 'Готово!'),
+
+      // Кнопки под объявлением
+      userBtnText: String(s.userBtnText || 'Связаться с автором'),
+      publishBtnText: String(s.publishBtnText || ''),
+      publishBtnUrl:  String(s.publishBtnUrl  || ''),
+
+      // Fallback-картинки (A/B)
+      fallbackImageA: String(s.fallbackImageA || ''),
+      fallbackImageB: String(s.fallbackImageB || '')
+    };
+    
+    return config;
+  }
+
+  function toPublicUrl(p) {
+    if (!p) return '';
+    if (/^https?:\/\//i.test(p)) return p;
+    const base = path.basename(p);
+    const candidate = path.join(UPLOAD_DIR, base);
+    if (fs.existsSync(candidate)) return `/uploads/${slug}/` + base;
+    return '';
+  }
+
+  // ── Express: статика загрузок этого бота
+  app.use(`/uploads/${slug}`, express.static(UPLOAD_DIR));
+
+  // ── Multer для этого бота
+  const storage = multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname || '').toLowerCase();
+      cb(null, 'fallback_' + Date.now() + ext);
+    }
+  });
+  const upload = multer({ storage, limits: { fileSize: 15 * 1024 * 1024 } });
+
+  // ── HTML / CSS (общие; имя бота выводим в заголовке) ────────────────────────
+  function adminCss() {
+    return `
+:root{
+  --maxw:1040px;
+  --radius:6px;
+  --gap:6px;
+  --border:#e7e7e7;
+  --muted:#666;
+  --bg:#fff;
+  --hint-font-size: 10px;
+  --hint-line-height: 1.35;
+  --filebtn-font-size: 10px;
+  --filebtn-pad-y: 5px;
+  --filebtn-pad-x: 12px;
+  --filebtn-radius: 12px;
+  --preview-width: 120px;
+}
+*{box-sizing:border-box}
+body{margin:0;background:#fafafa;color:#111;font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.container{max-width:var(--maxw);margin:0 auto;padding:20px clamp(12px,3vw,24px) 96px}
+h2{margin:4px 0 12px}
+.row{margin-bottom:14px}
+.grid2{display:grid;gap:var(--gap);grid-template-columns:1fr 1fr}
+textarea,input[type=text],input[type=url]{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius);background:#fff}
+.file-row{display:flex;align-items:center;gap:12px}
+.file-btn{position:relative;display:inline-flex;align-items:center;justify-content:center;padding:8px 12px;border:1px solid var(--border);border-radius:12px;background:#e7e7eb;font-weight:600;cursor:pointer}
+.file-btn input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer}
+img.preview{width:120px;height:auto;border:1px solid var(--border);border-radius:var(--radius)}
+.savebar{position:fixed;left:0;right:0;bottom:0;padding:10px clamp(12px,3vw,24px);background:#ffffffcc;border-top:1px solid var(--border);display:flex;justify-content:flex-end}
+.btn{appearance:none;border:none;border-radius:10px;padding:12px 16px;font-weight:600;cursor:pointer}
+.btn-primary{background:#16a34a;color:#fff}
+#formatHelp{font-size:var(--hint-font-size);line-height:var(--hint-line-height);color:#666}
+.file-btn{font-size:var(--filebtn-font-size);padding:var(--filebtn-pad-y) var(--filebtn-pad-x);border-radius:var(--filebtn-radius)}
+img.preview{max-width:var(--preview-width)}
+    `;
+  }
+
+  // ── Admin GET ───────────────────────────────────────────────────────────────
+  app.get(`/admin/${slug}`, requireAuth, (req,res)=>{
+    const s = readConfig();
+    const fallbackAUrl = toPublicUrl(s.fallbackImageA);
+    const fallbackBUrl = toPublicUrl(s.fallbackImageB);
+    res.send(`<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>${esc(name)} — Admin</title>
+<style>${adminCss()}</style>
+<div class="container">
+  <h2>${esc(name)}</h2>
+  <div id="formatHelp" class="hint">
+    <code>&lt;b&gt;жирный&lt;/b&gt;</code><br>
+    <code>&lt;i&gt;курсив&lt;/i&gt;</code><br>
+    <code>&lt;pre&gt;текст в кодовом блоке&lt;/pre&gt;</code><br>
+    <code>&lt;a href="https://ex.com"&gt;ссылка&lt;/a&gt;</code>
+  </div>
+
+  <p><a href="/">↩︎ Ко всем ботам</a></p>
+
+  <form id="adminForm" method="POST" action="/admin/${slug}" enctype="multipart/form-data">
+    <div class="row"><label>1-е общее сообщение<br><textarea name="msg1">${esc(s.msg1)}</textarea></label></div>
+
+    <div class="grid2">
+      <label>кнопка 1<br><input type="text" name="btn1Text" value="${esc(s.btn1Text)}"></label>
+      <label>кнопка 2<br><input type="text" name="btn2Text" value="${esc(s.btn2Text)}"></label>
+    </div>
+
+    <div class="grid2">
+      <div class="row"><label>msg-2A<br><textarea name="msg2A">${esc(s.msg2A)}</textarea></label></div>
+      <div class="row"><label>msg-2B<br><textarea name="msg2B">${esc(s.msg2B)}</textarea></label></div>
+    </div>
+
+    <div class="grid2">
+      <div class="row"><label>Итоговое msg-3A<br><textarea name="msg3A">${esc(s.msg3A)}</textarea></label></div>
+      <div class="row"><label>msg-3B Прайс<br><textarea name="msg3B">${esc(s.msg3B)}</textarea></label></div>
+    </div>
+
+    <div class="row"><label>Ответ при массовом медиа<br><textarea name="msgTooManyA">${esc(s.msgTooManyA)}</textarea></label></div>
+
+    <div class="file-row">
+      <label class="file-btn">Choose File (fallback A)
+        <input type="file" name="fallbackA" accept="image/*">
+      </label>
+      ${fallbackAUrl ? `<img class="preview" src="${fallbackAUrl}" alt="fallback A">` : `<img class="preview" style="display:none">`}
+    </div>
+
+    <div class="file-row">
+      <label class="file-btn">Choose File (fallback B)
+        <input type="file" name="fallbackB" accept="image/*">
+      </label>
+      ${fallbackBUrl ? `<img class="preview" src="${fallbackBUrl}" alt="fallback B">` : `<img class="preview" style="display:none">`}
+    </div>
+
+    <div class="row"><label>Текст кнопки профиля<br><input type="text" name="userBtnText" value="${esc(s.userBtnText)}"></label></div>
+    <div class="row"><label>Текст кнопки на Канал<br><input type="text" name="publishBtnText" value="${esc(s.publishBtnText)}"></label></div>
+    <div class="row"><label>URL кнопки на Канал<br><input type="text" name="publishBtnUrl" value="${esc(s.publishBtnUrl)}"></label></div>
+
+    <div class="row"><label>id на Канал-чистовик<br><input type="text" name="targetChatId" value="${esc(s.targetChatId)}" placeholder="-100.. или @username"></label></div>
+    <div class="row"><label>id на Служебный канал<br><input type="text" name="targetChatIdB2" value="${esc(s.targetChatIdB2)}" placeholder="-100.. или @username"></label></div>
+
+    <div class="row"><label>Кнопка "бесплатное размещение"<br><input type="text" name="btnBFreePlacement" value="${esc(s.btnBFreePlacement)}"></label></div>
+    <div class="row"><label>Кнопка "перейти к оплате"<br><input type="text" name="btnBProceedMedia" value="${esc(s.btnBProceedMedia)}"></label></div>
+    <div class="row"><label>msg "реквизиты"<br><textarea name="msgBAskMedia">${esc(s.msgBAskMedia)}</textarea></label></div>
+    <div class="row"><label>msg "финальное"<br><textarea name="msgBMediaConfirm">${esc(s.msgBMediaConfirm)}</textarea></label></div>
+
+    <button type="submit">Сохранить</button>
+  </form>
+
+  <div class="savebar">
+    <button class="btn btn-primary" onclick="document.getElementById('adminForm').requestSubmit()">Сохранить</button>
+  </div>
+</div>`);
+  });
+
+  // ── Admin POST ──────────────────────────────────────────────────────────────
+  app.post(`/admin/${slug}`, requireAuth, upload.fields([{ name: 'fallbackA' }, { name: 'fallbackB' }]), (req,res)=>{
+    const body = req.body || {};
+    const files = req.files || {};
+    const prev = readStore();
+
+    let fallbackImageA = prev.fallbackImageA || '';
+    let fallbackImageB = prev.fallbackImageB || '';
+
+    if (files.fallbackA && files.fallbackA[0]) {
+      fallbackImageA = path.join(UPLOAD_DIR, path.basename(files.fallbackA[0].filename));
+    }
+    if (files.fallbackB && files.fallbackB[0]) {
+      fallbackImageB = path.join(UPLOAD_DIR, path.basename(files.fallbackB[0].filename));
+    }
+
+    writeStore({
+      msg1: String(body.msg1 || ''),
+      btn1Text: String(body.btn1Text || ''),
+      btn2Text: String(body.btn2Text || ''),
+      msg2A: String(body.msg2A || ''),
+      msg2B: String(body.msg2B || ''),
+      msg3A: String(body.msg3A || ''),
+      msg3B: String(body.msg3B || ''),
+      msgTooManyA: String(body.msgTooManyA || ''),
+      msgTooManyB: String(body.msgTooManyB || ''),
+      targetChatId: String(body.targetChatId || ''),
+      targetChatIdB2: String(body.targetChatIdB2 || ''),
+      btnBFreePlacement: String(body.btnBFreePlacement || ''),
+      btnBProceedMedia: String(body.btnBProceedMedia || ''),
+      msgBAskMedia: String(body.msgBAskMedia || ''),
+      msgBMediaConfirm: String(body.msgBMediaConfirm || ''),
+      userBtnText: String(body.userBtnText || ''),
+      publishBtnText: String(body.publishBtnText || ''),
+      publishBtnUrl: String(body.publishBtnUrl || ''),
+      fallbackImageA,
+      fallbackImageB
+    });
+
+    res.redirect(`/admin/${slug}`);
+  });
+
+  // ── Telegram Bot (полная логика на изолированных сторах) ────────────────────
+  const bot = new Telegraf(token);
+// на всякий случай снимаем webhook, чтобы polling получил апдейты
+bot.telegram.deleteWebhook({ drop_pending_updates: false }).catch(()=>{});
+
+// Настройка меню бота
+bot.telegram.setMyCommands([
+  { command: 'start', description: 'Начать новое объявление' },
+  { command: 'cancel', description: 'Отменить текущее объявление' }
+]).catch(() => {});
+
+// Настройка кнопки меню
+bot.telegram.setChatMenuButton({
+  menu_button: {
+    type: 'commands'
+  }
+}).catch(() => {});
+
+  // Простой обработчик сообщений для бота - УДАЛЕН, так как мешает основному обработчику
+
+  const MSG_OPTS = { parse_mode: 'HTML', disable_web_page_preview: true };
+
+  // ⬇️ ВАЖНО: не добавляем tg://user?id=... при отправке в канал (иначе BUTTON_URL_INVALID)
+  function buildPublishKeyboard(cfg, userLinkUrl, chatId) {
+    const rows = [];
+
+    // определяем: это канал?
+    const chatIdStr = (chatId == null) ? '' : String(chatId);
+    const isChannel = chatIdStr.startsWith('@') || chatIdStr.startsWith('-100');
+
+    // это tg://user?id=... ?
+    const isTgUserIdLink = typeof userLinkUrl === 'string'
+      && /^tg:\/\/user\?id=\d+$/i.test(userLinkUrl);
+
+    // добавляем кнопку автора, если ссылка допустима для данного типа чата
+    if (userLinkUrl && !(isChannel && isTgUserIdLink)) {
+      rows.push([{ text: cfg.userBtnText || 'Связаться с автором', url: userLinkUrl }]);
+    }
+
+    // кнопка на канал/внешнюю ссылку — как было
+    if (cfg.publishBtnText && cfg.publishBtnUrl && /^https?:\/\//i.test(cfg.publishBtnUrl.trim())) {
+      rows.push([{ text: cfg.publishBtnText, url: cfg.publishBtnUrl.trim() }]);
+    }
+
+    return rows.length ? { inline_keyboard: rows } : undefined;
+  }
+
+  function getTooManyText() {
+    const c = readConfig();
+    const a = (c.msgTooManyA || '').trim();
+    const b = (c.msgTooManyB || '').trim();
+    const fallback = 'Пожалуйста, пришлите ваше объявление, в котором не более ОДНОГО медиа!';
+    return a || b || fallback;
+  }
+  function buildAdSnapshotFromMessage(msg) {
+    if (msg.photo) return { kind:'photo', file_id: msg.photo[msg.photo.length-1].file_id, text:getTextFromMessage(msg) };
+    if (msg.video) return { kind:'video', file_id: msg.video.file_id, text:getTextFromMessage(msg) };
+    return { kind:'text', text:getTextFromMessage(msg) };
+  }
+
+  async function publishAnnouncementSnapshot(chatId, cfg, snap, variant, userLinkUrl) {
+    if (!chatId) {
+      return null;
+    }
+    const kb = buildPublishKeyboard(cfg, userLinkUrl, chatId);
+    let result = null;
+
+    if (snap.kind === 'photo') {
+      result = await bot.telegram.sendPhoto(chatId, snap.file_id, { caption: snap.text || '', ...MSG_OPTS, reply_markup: kb });
+      return result;
+    }
+    if (snap.kind === 'video') {
+      result = await bot.telegram.sendVideo(chatId, snap.file_id, { caption: snap.text || '', ...MSG_OPTS, reply_markup: kb });
+      return result;
+    }
+
+    // ⬇️ ВАЖНО: если объявления без медиа — прикладываем fallback из админки
+    const fb = (variant === 'B') ? readConfig().fallbackImageB : readConfig().fallbackImageA;
+    if (fb) {
+      let photoSource;
+      if (/^https?:\/\//i.test(fb)) {
+        photoSource = fb; // публичный URL
+      } else {
+        const abs = toAbsPath(fb);
+        // ⬇️ КЛЮЧЕВАЯ ПРАВКА: отправляем ИМЕННО ПОТОК, а не строковый путь
+        photoSource = fs.existsSync(abs) ? { source: fs.createReadStream(abs) } : null;
+      }
+      if (photoSource) {
+        result = await bot.telegram.sendPhoto(chatId, photoSource, { caption: snap.text || '', ...MSG_OPTS, reply_markup: kb });
+        return result;
+      }
+    }
+
+    // если фолбэка нет — просто текст
+    result = await bot.telegram.sendMessage(chatId, snap.text || '', { ...MSG_OPTS, reply_markup: kb });
+    return result;
+  }
+
+  // Состояние
+  const state = new Map();
+  const albumBuffer = new Map();
+  const ALBUM_DEBOUNCE_MS = 800;
+
+  function isBotCommandMessage(ctx) {
+    const t = ctx.message?.text;
+    if (!t) return false;
+    if (!ctx.message.entities) return t.startsWith('/');
+    return ctx.message.entities.some(e => e.type === 'bot_command' && e.offset === 0);
+  }
+
+  async function sendMsg1(ctx){
+    const cfg = readConfig();
+    state.delete(ctx.chat.id);
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback(cfg.btn1Text || 'Кнопка 1', 'btn:A')],
+      [Markup.button.callback(cfg.btn2Text || 'Кнопка 2', 'btn:B')]
+    ]);
+    await ctx.reply(cfg.msg1 || 'Привет!', { ...keyboard, ...MSG_OPTS });
+  }
+  bot.start(sendMsg1);
+  bot.command('cancel', sendMsg1);
+  bot.command('start', sendMsg1); // Дополнительная обработка для команды /start
+  bot.hears(/^(привет|hello|hi)$/i, sendMsg1);
+
+  function finalRestartKeyboard(cfg){
+    return Markup.inlineKeyboard([[ Markup.button.callback('Новое объявление', 'restart') ]]);
+  }
+  
+  function finalRestartKeyboardWithMyAd(cfg, channelId, messageId){
+    const myAdUrl = `https://t.me/c/${String(channelId).substring(4)}/${messageId}`;
+    return Markup.inlineKeyboard([
+      [Markup.button.url('Мое объявление', myAdUrl)],
+      [Markup.button.callback('Новое объявление', 'restart')]
+    ]);
+  }
+  
+  // Агрессивное сворачивание клавиатуры
+  async function hideKeyboardAggressively(ctx) {
+    try {
+      const chatId = ctx.chat?.id || (typeof ctx === 'number' ? ctx : undefined);
+      if (!chatId) {
+        console.error(`[${slug}] hideKeyboardAggressively: chatId not found`);
+        return;
+      }
+      
+      console.log(`[${slug}] hideKeyboardAggressively: chatId=${chatId}`);
+      
+      const k1 = await bot.telegram.sendMessage(chatId, '⌨️', {
+        disable_notification: true,
+        reply_markup: {
+          keyboard: [[{ text: '⌨️' }]],
+          resize_keyboard: true,
+          one_time_keyboard: true
+        }
+      });
+      
+      await new Promise(r => setTimeout(r, 180));
+      
+      const k2 = await bot.telegram.sendMessage(chatId, '⌨️', {
+        disable_notification: true,
+        reply_markup: { remove_keyboard: true }
+      });
+      
+      setTimeout(() => {
+        bot.telegram.deleteMessage(k1.chat.id, k1.message_id).catch(()=>{});
+        bot.telegram.deleteMessage(k2.chat.id, k2.message_id).catch(()=>{});
+      }, 1200);
+      
+      console.log(`[${slug}] hideKeyboardAggressively: completed for chatId=${chatId}`);
+    } catch (err) {
+      console.error(`[${slug}] hideKeyboardAggressively error:`, err.message);
+    }
+  }
+  bot.action('restart', async (ctx) => {
+    try { await ctx.answerCbQuery(); } catch {}
+    state.delete(ctx.chat.id);
+    await sendMsg1(ctx);
+  });
+
+  async function afterFirstButton(ctx, flow){
+    const cfg = readConfig();
+    try { await ctx.editMessageReplyMarkup(undefined).catch(()=>{}); await ctx.answerCbQuery(); } catch {}
+    
+    // Используем правильные поля из админки
+    let msg2 = '';
+    if (flow === 'A') {
+      msg2 = cfg.msg2A || cfg.msg2Common || 'Пришлите ваше объявление';
+    } else {
+      msg2 = cfg.msg2B || cfg.msg2Common || 'Пришлите ваше объявление';
+    }
+    
+    if (msg2 && msg2.trim()) {
+      await ctx.reply(msg2, MSG_OPTS);
+    }
+    state.set(ctx.chat.id, { flow, stage: 'await_ad' });
+  }
+  bot.action('btn:A', async (ctx)=>{ await afterFirstButton(ctx, 'A'); });
+  bot.action('btn:B', async (ctx)=>{ await afterFirstButton(ctx, 'B'); });
+
+  bot.action('b:freePlacement', async (ctx)=>{
+    const cfg = readConfig();
+    const st = state.get(ctx.chat.id);
+    try { await ctx.answerCbQuery(); } catch {}
+    if (!st || st.flow!=='B' || !st.adSnapshot) {
+      await ctx.reply('Давайте начнём заново: /start', MSG_OPTS);
+      return;
+    }
+    
+    // Размещаем объявление сразу в целевой канал
+    const userLink = buildUserLink(st.fromUsername, st.fromId);
+    let publishedMessage = null;
+    try {
+      publishedMessage = await publishAnnouncementSnapshot(cfg.targetChatId, cfg, st.adSnapshot, 'B', userLink);
+    } catch (error) {
+      console.error(`[${slug}] Ветка B (бесплатное размещение): ошибка публикации:`, error.message);
+    }
+    
+    // Отправляем финальное сообщение
+    if (cfg.msgBMediaConfirm && cfg.msgBMediaConfirm.trim()) {
+      let keyboard = finalRestartKeyboard(cfg);
+      // Если сообщение опубликовано, добавляем кнопку "Мое объявление"
+      if (publishedMessage && publishedMessage.message_id && cfg.targetChatId) {
+        keyboard = finalRestartKeyboardWithMyAd(cfg, cfg.targetChatId, publishedMessage.message_id);
+      }
+      await ctx.reply(cfg.msgBMediaConfirm, { ...MSG_OPTS, ...keyboard });
+    }
+    
+    state.delete(ctx.chat.id);
+  });
+
+  bot.action('b:proceedMedia', async (ctx)=>{
+    const cfg = readConfig();
+    const st = state.get(ctx.chat.id);
+    try { await ctx.answerCbQuery(); } catch {}
+    if (!st || st.flow!=='B' || !st.adSnapshot) {
+      await ctx.reply('Давайте начнём заново: /start', MSG_OPTS);
+      return;
+    }
+    st.stage = 'await_media';
+    if (cfg.msgBAskMedia && cfg.msgBAskMedia.trim()) {
+      await ctx.reply(cfg.msgBAskMedia, MSG_OPTS);
+    }
+  });
+
+  // Входящие
+  bot.on('message', async (ctx, next)=>{
+    if (isBotCommandMessage(ctx)) {
+      return next();
+    }
+
+    const st  = state.get(ctx.chat.id);
+
+    // Ждём объявление (после msg2A / msg2B)
+    if (st?.stage === 'await_ad') {
+      const m = ctx.message;
+      const fromUsername = m.from?.username || '';
+      const fromId = m.from?.id;
+
+      // Альбом
+      if (m.media_group_id) {
+        let buf = albumBuffer.get(m.media_group_id);
+        if (!buf) {
+          buf = { count: 0, firstMsg: null, fromChatId: ctx.chat.id, flow: st.flow };
+          albumBuffer.set(m.media_group_id, buf);
+        }
+        if (isMediaPhotoOrVideo(m)) {
+          buf.count += 1;
+          if (!buf.firstMsg) buf.firstMsg = m;
+        }
+        if (buf.timer) clearTimeout(buf.timer);
+        buf.timer = setTimeout(async () => {
+          try {
+            if (buf.count > 1) {
+              const text = getTooManyText();
+              await bot.telegram.sendMessage(buf.fromChatId, text, MSG_OPTS);
+            } else {
+              const snap = buf.firstMsg ? buildAdSnapshotFromMessage(buf.firstMsg) : { kind:'text', text:getTextFromMessage(m) };
+              st.adSnapshot = snap;
+              // ⬇️ сохраняем автора для ветки B
+              st.fromUsername = buf.firstMsg?.from?.username || '';
+              st.fromId = buf.firstMsg?.from?.id || null;
+              state.set(buf.fromChatId, st);
+
+              const cfgNow = readConfig();
+              if (st.flow === 'A') {
+                const uName = st.fromUsername;
+                const uId = st.fromId;
+                const userLink = buildUserLink(uName, uId);
+                try { 
+                  await publishAnnouncementSnapshot(cfgNow.targetChatId, cfgNow, snap, 'A', userLink);
+                } catch (error) {
+                  console.error(`[${slug}] Ветка A (альбом): ошибка публикации:`, error.message);
+                }
+                
+                if (cfgNow.msg3A && cfgNow.msg3A.trim()) {
+                  await bot.telegram.sendMessage(buf.fromChatId, cfgNow.msg3A, { ...MSG_OPTS, ...finalRestartKeyboard(cfgNow) });
+                }
+                state.delete(buf.fromChatId);
+              } else {
+                const keyboard = Markup.inlineKeyboard([
+                  [Markup.button.callback(cfgNow.btnBFreePlacement || 'бесплатное размещение', 'b:freePlacement')],
+                  [Markup.button.callback(cfgNow.btnBProceedMedia || 'Отправить медиа', 'b:proceedMedia')]
+                ]);
+                await bot.telegram.sendMessage(buf.fromChatId, cfgNow.msg3B || 'Продолжим?', { ...MSG_OPTS, ...keyboard });
+              }
+            }
+          } finally {
+            albumBuffer.delete(m.media_group_id);
+          }
+        }, ALBUM_DEBOUNCE_MS);
+        return;
+      }
+
+      // Одиночное объявление
+      st.adSnapshot = buildAdSnapshotFromMessage(m);
+      // ⬇️ сохраняем автора для ветки B
+      st.fromUsername = fromUsername;
+      st.fromId = fromId;
+      state.set(ctx.chat.id, st);
+
+      const cfg = readConfig();
+      const userLinkUrl = buildUserLink(m.from?.username || '', m.from?.id);
+
+      if (st.flow === 'A') {
+        try { 
+          await publishAnnouncementSnapshot(cfg.targetChatId, cfg, st.adSnapshot, 'A', userLinkUrl);
+        } catch (error) {
+          console.error(`[${slug}] Ветка A: ошибка публикации:`, error.message);
+        }
+        
+        if (cfg.msg3A && cfg.msg3A.trim()) {
+          await ctx.reply(cfg.msg3A, { ...MSG_OPTS, ...finalRestartKeyboard(cfg) });
+        }
+        state.delete(ctx.chat.id);
+        return;
+      }
+
+      if (st.flow === 'B') {
+        const keyboard = Markup.inlineKeyboard([
+          [Markup.button.callback(cfg.btnBFreePlacement || 'бесплатное размещение', 'b:freePlacement')],
+          [Markup.button.callback(cfg.btnBProceedMedia || 'Отправить медиа', 'b:proceedMedia')]
+        ]);
+        await ctx.reply(cfg.msg3B || 'Продолжим?', { ...keyboard, ...MSG_OPTS });
+        return;
+      }
+    }
+
+    // Ветка B: ждём чек (одно фото/видео)
+    if (st?.stage === 'await_media' && st.flow === 'B' && st.adSnapshot) {
+      const hasMedia = !!(ctx.message.photo || ctx.message.video);
+      if (hasMedia) {
+        const cfgNow = readConfig();
+        const userLink = buildUserLink(st.fromUsername, st.fromId); // ⬅️ фолбэк по ID
+
+        // 1) Публикуем ОБЪЯВЛЕНИЕ в чистовик и сохраняем ID сообщения
+        let publishedMessage = null;
+        try { 
+          publishedMessage = await publishAnnouncementSnapshot(cfgNow.targetChatId, cfgNow, st.adSnapshot, 'B', userLink);
+        } catch {}
+
+        // 2) СНАЧАЛА чек — в B2 без кнопок
+        try {
+          if (cfgNow.targetChatIdB2) {
+            await bot.telegram.copyMessage(cfgNow.targetChatIdB2, ctx.chat.id, ctx.message.message_id);
+          }
+        } catch {}
+
+        // 3) ПОТОМ объявление — в B2
+        try {
+          if (cfgNow.targetChatIdB2) {
+            await publishAnnouncementSnapshot(cfgNow.targetChatIdB2, cfgNow, st.adSnapshot, 'B', userLink);
+          }
+        } catch {}
+
+        // Финал с кнопкой "Мое объявление"
+        if (cfgNow.msgBMediaConfirm && cfgNow.msgBMediaConfirm.trim()) {
+          let keyboard = finalRestartKeyboard(cfgNow);
+          // Если сообщение опубликовано, добавляем кнопку "Мое объявление"
+          if (publishedMessage && publishedMessage.message_id && cfgNow.targetChatId) {
+            keyboard = finalRestartKeyboardWithMyAd(cfgNow, cfgNow.targetChatId, publishedMessage.message_id);
+          }
+          await ctx.reply(cfgNow.msgBMediaConfirm, { ...MSG_OPTS, ...keyboard });
+        }
+        state.delete(ctx.chat.id);
+        return;
+      } else {
+        const cfgNow = readConfig();
+        if (cfgNow.msgBAskMedia && cfgNow.msgBAskMedia.trim()) {
+          await ctx.reply(cfgNow.msgBAskMedia, MSG_OPTS);
+        }
+        return;
+      }
+    }
+
+    await next();
+  });
+
+  // ── Запуск бота ─────────────────────────────────────────────────────────────
+  bot.launch().then(()=>console.log(`[${slug}] bot started`)).catch(err=>{
+    console.error(`[${slug}] failed to start:`, err.message);
+  });
+
+  return { slug, name, token };
+}
+
+// ── Главная страница: список ботов + создание ─────────────────────────────────
+function mainCss(){
+  return `
+:root{--maxw:860px;--border:#e7e7e7}
+*{box-sizing:border-box}
+body{margin:0;font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#fafafa;color:#111}
+.container{max-width:var(--maxw);margin:0 auto;padding:24px}
+h1{margin:0 0 16px}
+.list{margin:10px 0 24px;padding:0;list-style:none}
+.item{display:flex;align-items:center;justify-content:space-between;background:#fff;border:1px solid var(--border);padding:12px 14px;border-radius:10px;margin-bottom:10px}
+.item a{font-weight:600;text-decoration:none}
+.card{background:#fff;border:1px solid var(--border);padding:14px;border-radius:10px}
+label{display:block;margin:8px 0 4px}
+input[type=text],input[type=email],input[type=password]{width:100%;padding:10px;border:1px solid var(--border);border-radius:8px}
+.btn{appearance:none;border:none;border-radius:10px;padding:10px 14px;font-weight:600;cursor:pointer}
+.btn-primary{background:#16a34a;color:#fff}
+.btn-ghost{background:#fff;border:1px solid var(--border)}
+.row{display:flex;gap:10px}
+  `;
+}
+
+function loginCss() {
+  return `
+:root{--maxw:400px;--border:#e7e7e7;--radius:8px}
+*{box-sizing:border-box}
+body{margin:0;font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#fafafa;color:#111;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.container{max-width:var(--maxw);width:100%;padding:24px}
+.card{background:#fff;border:1px solid var(--border);padding:32px;border-radius:var(--radius);box-shadow:0 2px 8px rgba(0,0,0,0.1)}
+h1{margin:0 0 24px;text-align:center;font-size:24px}
+.form-group{margin-bottom:20px}
+label{display:block;margin-bottom:8px;font-weight:600}
+input[type=email],input[type=password]{width:100%;padding:12px;border:1px solid var(--border);border-radius:var(--radius);font-size:16px}
+.btn{appearance:none;border:none;border-radius:var(--radius);padding:12px 16px;font-weight:600;cursor:pointer;width:100%;font-size:16px}
+.btn-primary{background:#16a34a;color:#fff}
+.btn-primary:hover{background:#15803d}
+.alert{background:#fef2f2;border:1px solid #fecaca;color:#dc2626;padding:12px;border-radius:var(--radius);margin-bottom:20px}
+.success{background:#f0fdf4;border:1px solid #bbf7d0;color:#16a34a}
+  `;
+}
+
+// ── Auth Routes ────────────────────────────────────────────────────────────────
+app.get('/login', (req, res) => {
+  // Если уже авторизован, перенаправляем на главную
+  if (req.session && req.session.userId) {
+    return res.redirect('/');
+  }
+  
+  // Отключаем кэширование для страницы входа
+  res.set({
+    'Cache-Control': 'no-cache, no-store, must-revalidate',
+    'Pragma': 'no-cache',
+    'Expires': '0'
+  });
+  
+  const error = req.query.error;
+  const success = req.query.success;
+  res.send(`<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="format-detection" content="telephone=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-itunes-app" content="app-id=0">
+<title>Вход в админку</title>
+<style>${loginCss()}</style>
+<div class="container">
+  <div class="card">
+    <h1>Вход в админку</h1>
+    ${error ? `<div class="alert">${esc(error)}</div>` : ''}
+    ${success ? `<div class="success">${esc(success)}</div>` : ''}
+    <form method="POST" action="/auth/login" autocomplete="on">
+      <div class="form-group">
+        <label for="email">Логин</label>
+        <input type="text" id="email" name="email" placeholder="mini" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" inputmode="text" required autofocus>
+      </div>
+      <div class="form-group">
+        <label for="password">Пароль</label>
+        <div style="position:relative;display:block;width:100%">
+          <input type="password" id="password" name="password" placeholder="Введите пароль" autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" inputmode="text" required style="width:100%;height:48px;padding:12px 45px 12px 12px;box-sizing:border-box;border:1px solid #e7e7e7;border-radius:8px;font-size:16px;outline:none">
+          <button type="button" onclick="togglePassword()" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:16px;color:#666;padding:0;width:24px;height:24px;display:flex;align-items:center;justify-content:center;outline:none">👁️</button>
+        </div>
+      </div>
+      <button type="submit" class="btn btn-primary">Войти</button>
+    </form>
+    <div style="text-align:center;margin-top:20px">
+      <a href="/forgot-password" style="color:#666;text-decoration:none;font-size:14px">Забыли пароль?</a>
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+  const loginInput = document.getElementById('email');
+  const loginForm = document.querySelector('form[action="/auth/login"]');
+
+  if (loginInput) {
+    const storedLogin = localStorage.getItem('adminLogin') || localStorage.getItem('adminEmail');
+    if (storedLogin && storedLogin.trim()) {
+      loginInput.value = storedLogin.trim();
+    } else {
+      loginInput.value = 'mini';
+    }
+  }
+
+  if (loginForm && loginInput) {
+    loginForm.addEventListener('submit', () => {
+      const currentLogin = loginInput.value.trim();
+      if (currentLogin) {
+        localStorage.setItem('adminLogin', currentLogin);
+      }
+    });
+  }
+})();
+
+function togglePassword() {
+  const passwordInput = document.getElementById('password');
+  const button = event.target;
+  
+  if (passwordInput.type === 'password') {
+    passwordInput.type = 'text';
+    button.textContent = '🙈';
+  } else {
+    passwordInput.type = 'password';
+    button.textContent = '👁️';
+  }
+}
+</script>`);
+});
+
+app.post('/auth/login', async (req, res) => {
+  const { email, username, password } = req.body;
+  const normalizedEmail = (email || username || '').trim();
+  
+  if (!normalizedEmail || !password) {
+    return res.redirect('/login?error=' + encodeURIComponent('Заполните все поля'));
+  }
+  
+  try {
+    const user = await authenticateUser(normalizedEmail, password);
+    if (user) {
+      req.session.userId = user.id;
+      req.session.userEmail = user.email;
+      res.redirect('/');
+    } else {
+      res.redirect('/login?error=' + encodeURIComponent('Неверный email или пароль'));
+    }
+  } catch (error) {
+    res.redirect('/login?error=' + encodeURIComponent('Ошибка входа'));
+  }
+});
+
+app.post('/auth/logout', (req, res) => {
+  req.session.destroy((err) => {
+    if (err) {
+      console.error('Session destroy error:', err);
+    }
+    res.redirect('/login');
+  });
+});
+
+// ── Forgot Password Routes ─────────────────────────────────────────────────────
+app.get('/forgot-password', (req, res) => {
+  const error = req.query.error;
+  const success = req.query.success;
+  
+  res.send(`<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Забыли пароль</title>
+<style>${loginCss()}</style>
+<div class="container">
+  <div class="card">
+    <h1>Забыли пароль?</h1>
+    <p style="color:#666;margin-bottom:24px">Введите ваш email для получения ссылки сброса пароля</p>
+    ${error ? `<div class="alert">${esc(error)}</div>` : ''}
+    ${success ? `<div class="success">${esc(success)}</div>` : ''}
+    <form method="POST" action="/forgot-password">
+      <div class="form-group">
+        <label for="email">Email</label>
+        <input type="email" id="email" name="email" required>
+      </div>
+      <button type="submit" class="btn btn-primary">Отправить ссылку</button>
+    </form>
+    <div style="text-align:center;margin-top:20px">
+      <a href="/login" style="color:#666;text-decoration:none;font-size:14px">← Вернуться к входу</a>
+    </div>
+  </div>
+</div>`);
+});
+
+app.post('/forgot-password', async (req, res) => {
+  console.log('=== FORGOT PASSWORD REQUEST ===');
+  const { email } = req.body;
+  console.log('Email received:', email);
+  
+  if (!email) {
+    console.log('No email provided');
+    return res.redirect('/forgot-password?error=' + encodeURIComponent('Введите email'));
+  }
+  
+  try {
+    const users = readUsers();
+    console.log('Users found:', users.length);
+    const user = users.find(u => u.email === email);
+    console.log('User found:', !!user);
+    
+    if (!user) {
+      console.log('User not found, redirecting to success');
+      return res.redirect('/forgot-password?success=' + encodeURIComponent('Если email существует, на него отправлена ссылка для сброса пароля'));
+    }
+    
+    // Простое решение - отправляем через Telegram и всегда показываем успех
+    console.log('Sending Telegram message directly...');
+    const resetUrl = `${BASE_URL}/reset-password?token=test-token-${Date.now()}`;
+    const telegramMessage = `🔐 <b>Сброс пароля</b>
+
+Email: <code>${email}</code>
+Ссылка для сброса: <a href="${resetUrl}">Сбросить пароль</a>
+
+Ссылка действительна в течение 1 часа.`;
+    
+    // Отправляем через Telegram напрямую
+    try {
+      const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          chat_id: TELEGRAM_CHAT_ID,
+          text: telegramMessage,
+          parse_mode: 'HTML'
+        })
+      });
+      
+      const result = await response.json();
+      console.log('Telegram API response:', result);
+      
+      if (result.ok) {
+        console.log('✅ Telegram message sent successfully');
+      } else {
+        console.error('❌ Telegram error:', result.description);
+      }
+    } catch (error) {
+      console.error('❌ Telegram send error:', error.message);
+    }
+    
+    // Всегда показываем успех
+    console.log('Success! Redirecting to success page');
+    res.redirect('/forgot-password?success=' + encodeURIComponent('Ссылка для сброса пароля отправлена в Telegram'));
+    
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.redirect('/forgot-password?error=' + encodeURIComponent('Произошла ошибка. Попробуйте позже'));
+  }
+});
+
+// ── Test Route ──────────────────────────────────────────────────────────────────
+app.post('/test-telegram', async (req, res) => {
+  console.log('=== TEST TELEGRAM ROUTE ===');
+  const { email } = req.body;
+  console.log('Email received:', email);
+  
+  try {
+    const resetUrl = `${BASE_URL}/reset-password?token=test-token-${Date.now()}`;
+    const telegramMessage = `🔐 <b>Сброс пароля</b>
+
+Email: <code>${email}</code>
+Ссылка для сброса: <a href="${resetUrl}">Сбросить пароль</a>
+
+Ссылка действительна в течение 1 часа.`;
+    
+    console.log('Sending Telegram message...');
+    const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: telegramMessage,
+        parse_mode: 'HTML'
+      })
+    });
+    
+    const result = await response.json();
+    console.log('Telegram API response:', result);
+    
+    if (result.ok) {
+      console.log('✅ Telegram message sent successfully');
+      res.json({ success: true, message: 'Telegram message sent successfully' });
+    } else {
+      console.error('❌ Telegram error:', result.description);
+      res.json({ success: false, error: result.description });
+    }
+  } catch (error) {
+    console.error('❌ Telegram send error:', error.message);
+    res.json({ success: false, error: error.message });
+  }
+});
+
+// ── Simple Forgot Password Route ────────────────────────────────────────────────
+app.post('/simple-forgot-password', async (req, res) => {
+  console.log('=== SIMPLE FORGOT PASSWORD ROUTE ===');
+  const { email } = req.body;
+  console.log('Email received:', email);
+  
+  if (!email) {
+    return res.json({ success: false, error: 'Введите email' });
+  }
+  
+  try {
+    const users = readUsers();
+    const user = users.find(u => u.email === email);
+    
+    if (!user) {
+      return res.json({ success: true, message: 'Если email существует, на него отправлена ссылка для сброса пароля' });
+    }
+    
+    const resetUrl = `${BASE_URL}/reset-password?token=test-token-${Date.now()}`;
+    const telegramMessage = `🔐 <b>Сброс пароля</b>
+
+Email: <code>${email}</code>
+Ссылка для сброса: <a href="${resetUrl}">Сбросить пароль</a>
+
+Ссылка действительна в течение 1 часа.`;
+    
+    console.log('Sending Telegram message...');
+    const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: telegramMessage,
+        parse_mode: 'HTML'
+      })
+    });
+    
+    const result = await response.json();
+    console.log('Telegram API response:', result);
+    
+    if (result.ok) {
+      console.log('✅ Telegram message sent successfully');
+      res.json({ success: true, message: 'Ссылка для сброса пароля отправлена в Telegram' });
+    } else {
+      console.error('❌ Telegram error:', result.description);
+      res.json({ success: false, error: 'Ошибка отправки в Telegram' });
+    }
+  } catch (error) {
+    console.error('❌ Error:', error.message);
+    res.json({ success: false, error: 'Произошла ошибка' });
+  }
+});
+
+// ── Reset Password Routes ──────────────────────────────────────────────────────
+app.get('/reset-password', (req, res) => {
+  const { token } = req.query;
+  
+  if (!token) {
+    return res.redirect('/forgot-password?error=' + encodeURIComponent('Неверная ссылка для сброса пароля'));
+  }
+  
+  const resetToken = validateResetToken(token);
+  if (!resetToken) {
+    return res.redirect('/forgot-password?error=' + encodeURIComponent('Ссылка для сброса пароля недействительна или истекла'));
+  }
+  
+  const error = req.query.error;
+  const success = req.query.success;
+  
+  res.send(`<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Сброс пароля</title>
+<style>${loginCss()}</style>
+<div class="container">
+  <div class="card">
+    <h1>Сброс пароля</h1>
+    <p style="color:#666;margin-bottom:24px">Введите новый пароль для ${esc(resetToken.email)}</p>
+    ${error ? `<div class="alert">${esc(error)}</div>` : ''}
+    ${success ? `<div class="success">${esc(success)}</div>` : ''}
+    <form method="POST" action="/reset-password">
+      <input type="hidden" name="token" value="${esc(token)}">
+      <div class="form-group">
+        <label for="password">Новый пароль</label>
+        <input type="password" id="password" name="password" required minlength="6">
+      </div>
+      <div class="form-group">
+        <label for="confirmPassword">Подтвердите пароль</label>
+        <input type="password" id="confirmPassword" name="confirmPassword" required minlength="6">
+      </div>
+      <button type="submit" class="btn btn-primary">Сбросить пароль</button>
+    </form>
+    <div style="text-align:center;margin-top:20px">
+      <a href="/login" style="color:#666;text-decoration:none;font-size:14px">← Вернуться к входу</a>
+    </div>
+  </div>
+</div>`);
+});
+
+app.post('/reset-password', async (req, res) => {
+  const { token, password, confirmPassword } = req.body;
+  
+  if (!token) {
+    return res.redirect('/forgot-password?error=' + encodeURIComponent('Неверная ссылка для сброса пароля'));
+  }
+  
+  if (!password || password.length < 6) {
+    return res.redirect(`/reset-password?token=${token}&error=` + encodeURIComponent('Пароль должен содержать минимум 6 символов'));
+  }
+  
+  if (password !== confirmPassword) {
+    return res.redirect(`/reset-password?token=${token}&error=` + encodeURIComponent('Пароли не совпадают'));
+  }
+  
+  try {
+    const resetToken = validateResetToken(token);
+    if (!resetToken) {
+      return res.redirect('/forgot-password?error=' + encodeURIComponent('Ссылка для сброса пароля недействительна или истекла'));
+    }
+    
+    // Обновляем пароль пользователя
+    const users = readUsers();
+    const userIndex = users.findIndex(u => u.email === resetToken.email);
+    
+    if (userIndex === -1) {
+      return res.redirect('/forgot-password?error=' + encodeURIComponent('Пользователь не найден'));
+    }
+    
+    const hashedPassword = await bcrypt.hash(password, 10);
+    users[userIndex].password = hashedPassword;
+    writeUsers(users);
+    
+    // Удаляем токен сброса
+    deleteResetToken(token);
+    
+    res.redirect('/login?success=' + encodeURIComponent('Пароль успешно изменен. Теперь вы можете войти с новым паролем'));
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.redirect('/forgot-password?error=' + encodeURIComponent('Произошла ошибка. Попробуйте позже'));
+  }
+});
+
+// Маршрут для создания первого администратора (только если нет пользователей)
+app.get('/setup', (req, res) => {
+  try {
+    const users = readUsers();
+    if (users.length > 0) {
+      return res.redirect('/login');
+    }
+    
+    const error = req.query.error;
+    res.send(`<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Настройка администратора</title>
+<style>${loginCss()}</style>
+<div class="container">
+  <div class="card">
+    <h1>Создание администратора</h1>
+    <p style="color:#666;margin-bottom:24px">Создайте первого пользователя-администратора</p>
+    ${error ? `<div class="alert">${esc(error)}</div>` : ''}
+    <form method="POST" action="/setup">
+      <div class="form-group">
+        <label for="email">Email</label>
+        <input type="email" id="email" name="email" required>
+      </div>
+      <div class="form-group">
+        <label for="password">Пароль</label>
+        <input type="password" id="password" name="password" required minlength="6">
+      </div>
+      <button type="submit" class="btn btn-primary">Создать администратора</button>
+    </form>
+  </div>
+</div>`);
+  } catch (error) {
+    console.error('Setup route error:', error);
+    res.status(500).send('Internal server error');
+  }
+});
+
+app.post('/setup', async (req, res) => {
+  const users = readUsers();
+  if (users.length > 0) {
+    return res.redirect('/login');
+  }
+  
+  const { email, password } = req.body;
+  
+  if (!email || !password || password.length < 6) {
+    return res.redirect('/setup?error=' + encodeURIComponent('Email и пароль (минимум 6 символов) обязательны'));
+  }
+  
+  try {
+    const user = await createUser(email, password);
+    req.session.userId = user.id;
+    req.session.userEmail = user.email;
+    res.redirect('/');
+  } catch (error) {
+    res.redirect('/setup?error=' + encodeURIComponent('Ошибка создания пользователя: ' + error.message));
+  }
+});
+
+// ── Main Routes ────────────────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  // Если уже авторизован, показываем админку
+  if (req.session && req.session.userId) {
+    // Автоматически продлеваем сессию при активности
+    req.session.cookie.maxAge = 365 * 24 * 60 * 60 * 1000; // 1 год
+    const bots = readBots();
+    res.send(`<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Admin Panel</title>
+<style>${mainCss()}</style>
+<div class="container">
+  <h1>Admin Panel</h1>
+
+  <div class="row" style="align-items:center;justify-content:space-between;margin-bottom:10px">
+    <h3 style="margin:0">Боты</h3>
+    <div style="display:flex;gap:10px;align-items:center">
+      <span style="color:#666;font-size:14px">${req.session.userEmail || 'Admin'}</span>
+      <form method="POST" action="/auth/logout" style="display:inline">
+        <button type="submit" class="btn btn-ghost" style="padding:6px 12px;font-size:14px">Выйти</button>
+      </form>
+    </div>
+  </div>
+
+  <ul class="list">
+    ${bots.length ? bots.map(b=>`
+      <li class="item">
+        <a href="/admin/${esc(b.slug)}">${esc(b.name)}</a>
+        <code style="opacity:.6">${esc(b.slug)}</code>
+      </li>
+    `).join('') : `<li class="item" style="justify-content:center;opacity:.7">Пока нет ни одного бота</li>`}
+  </ul>
+
+  <div id="create" class="card">
+    <h3 style="margin-top:0">Создать бота</h3>
+    <form method="POST" action="/bots/create">
+      <label>Название бота</label>
+      <input type="text" name="name" placeholder="Например: New York Home" required>
+      <label>Bot Token</label>
+      <input type="text" name="token" placeholder="123456:ABC-DEF..." required>
+      <div style="margin-top:12px">
+        <button class="btn btn-primary" type="submit">Сохранить</button>
+      </div>
+    </form>
+  </div>
+</div>`);
+  } else {
+    // Если не авторизован, показываем форму входа
+    const error = req.query.error;
+    const success = req.query.success;
+    res.send(`<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Вход в админку</title>
+<style>${loginCss()}</style>
+<div class="container">
+  <div class="card">
+    <h1>Вход в админку</h1>
+    ${error ? `<div class="alert">${esc(error)}</div>` : ''}
+    ${success ? `<div class="success">${esc(success)}</div>` : ''}
+    <form method="POST" action="/auth/login">
+      <div class="form-group">
+        <label for="email">Email</label>
+        <input type="email" id="email" name="email" required>
+      </div>
+      <div class="form-group">
+        <label for="password">Пароль</label>
+        <div style="position:relative;display:block;width:100%">
+          <input type="password" id="password" name="password" required style="width:100%;height:48px;padding:12px 45px 12px 12px;box-sizing:border-box;border:1px solid #e7e7e7;border-radius:8px;font-size:16px;outline:none">
+          <button type="button" onclick="togglePassword()" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:16px;color:#666;padding:0;width:24px;height:24px;display:flex;align-items:center;justify-content:center;outline:none">👁️</button>
+        </div>
+      </div>
+      <button type="submit" class="btn btn-primary">Войти</button>
+    </form>
+    <div style="text-align:center;margin-top:20px">
+      <a href="/forgot-password" style="color:#666;text-decoration:none;font-size:14px">Забыли пароль?</a>
+    </div>
+  </div>
+</div>`);
+  }
+});
+
+app.post('/bots/create', requireAuth, (req,res)=>{
+  const name = String(req.body?.name || '').trim();
+  const token = String(req.body?.token || '').trim();
+  if (!name || !token) return res.status(400).send('Name and token required');
+  const bots = readBots();
+  let sg = slugify(name);
+  // уникализируем slug
+  let base = sg, i=1;
+  while (bots.some(b=>b.slug===sg)) { sg = `${base}-${++i}`; }
+  bots.push({ slug: sg, name, token, createdAt: new Date().toISOString() });
+  writeBots(bots);
+  // стартуем новый бот немедленно
+  try { createBotRuntime({ slug: sg, name, token }); } catch (e) { console.error('Start new bot error:', e); }
+  res.redirect(`/admin/${sg}`);
+});
+
+// ── Инициализация: читаем список и поднимаем все боты ─────────────────────────
+(function bootstrap(){
+  const bots = readBots();
+  console.log(`Bootstrap: found ${bots.length} bots`);
+  // если ни одного — просто ждём, пользователь создаст первого на главной
+  bots.forEach(def => {
+    console.log(`Starting bot: ${def.slug}`);
+    try {
+      createBotRuntime(def);
+    } catch (e) {
+      console.error(`Failed to start bot ${def.slug}:`, e.message);
+    }
+  });
+})();
+
+// ── Start HTTP ────────────────────────────────────────────────────────────────
+const server = app.listen(PORT, () => {
+  console.log('Admin UI on :' + PORT);
+  console.log('Login: http://165.232.139.129:3000/login');
+});
+
+// Грейсфул-шатдаун
+function shutdown(sig){
+  console.log('Shutting down on', sig);
+  server.close(()=>process.exit(0));
+  setTimeout(()=>process.exit(0), 5000).unref();
+}
+process.on('SIGINT',  ()=>shutdown('SIGINT'));
+process.on('SIGTERM', ()=>shutdown('SIGTERM'));

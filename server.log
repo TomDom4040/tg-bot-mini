@@ -1,0 +1,18 @@
+[dotenv@17.2.3] injecting env (9) from .env -- tip: 🔐 prevent building .env in docker: https://dotenvx.com/prebuild
+=== Environment Variables ===
+TELEGRAM_BOT_TOKEN: SET (8435259716...)
+TELEGRAM_CHAT_ID: SET
+EMAIL_USER: SET
+BASE_URL: http://165.232.139.129:3000
+Bootstrap: found 9 bots
+Starting bot: bot
+Starting bot: bot-2
+Starting bot: bot-3
+Starting bot: bot-4
+Starting bot: bot-5
+Starting bot: bot-6
+Starting bot: bot-7
+Starting bot: bot-8
+Starting bot: password-reset-bot
+Admin UI on :3000
+Login: http://165.232.139.129:3000/login

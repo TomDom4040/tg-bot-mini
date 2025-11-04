@@ -1,0 +1,58 @@
+{
+  "bots": [
+    {
+      "slug": "bot",
+      "name": "Жильё Нью Йорк",
+      "token": "8448842574:AAFGo9FkQbhuMHf3ho0l4CN3iM7SVlDpey0",
+      "createdAt": "2025-09-21T02:55:07.260Z"
+    },
+    {
+      "slug": "bot-2",
+      "name": "Жильё Чикаго",
+      "token": "7643445334:AAF7btaf8CjXk8b9dQg4mxn97MCZTJmR8mA",
+      "createdAt": "2025-09-21T03:29:33.813Z"
+    },
+    {
+      "slug": "bot-3",
+      "name": "Работа Нью Йорк",
+      "token": "7826290407:AAGctVaIQjVPYSFuZzbAhZ2fl_NhBjxqLYs",
+      "createdAt": "2025-09-21T21:06:16.475Z"
+    },
+    {
+      "slug": "bot-4",
+      "name": "Работа Чикаго",
+      "token": "8230415697:AAGVuxK-iDwv2orR7SijJNKZ2RPU8CmsMvY",
+      "createdAt": "2025-09-21T22:32:47.274Z"
+    },
+    {
+      "slug": "bot-5",
+      "name": "Жилье Лос Анджелес",
+      "token": "7975115034:AAFyCaCnl3TaPhYAVbAzivbbqr1-3kyvp1E",
+      "createdAt": "2025-09-21T23:18:43.466Z"
+    },
+    {
+      "slug": "bot-6",
+      "name": "Работа Лос Анджелес",
+      "token": "7590561184:AAF7IkIm7Yzf981TpVROSY9PR-rjkB1AbUs",
+      "createdAt": "2025-09-22T01:17:26.720Z"
+    },
+    {
+      "slug": "bot-7",
+      "name": "Жилье Майами",
+      "token": "7530132886:AAHAOrvSPnnPRsg2EPduWpF1dAeZUIHhV74",
+      "createdAt": "2025-09-22T02:22:55.741Z"
+    },
+    {
+      "slug": "bot-8",
+      "name": "Работа Майами",
+      "token": "8176640489:AAEF-qW_El4cQnTiYHlnjwqgSrMLzFZYd74",
+      "createdAt": "2025-10-07T01:52:39.554Z"
+    },
+    {
+      "slug": "password-reset-bot",
+      "name": "Password Reset Bot",
+      "token": "8435259716:AAGW9FVJaNEMWfyfJB_wTC7IQO4yLdYM7TU",
+      "createdAt": "2025-01-23T06:45:00.000Z"
+    }
+  ]
+}
