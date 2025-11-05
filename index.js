@@ -909,7 +909,13 @@ bot.telegram.setChatMenuButton({
                   [Markup.button.callback(cfgNow.btnBFreePlacement || 'бесплатное размещение', 'b:freePlacement')],
                   [Markup.button.callback(cfgNow.btnBProceedMedia || 'Отправить медиа', 'b:proceedMedia')]
                 ]);
-                await bot.telegram.sendMessage(buf.fromChatId, cfgNow.msg3B || 'Продолжим?', { ...MSG_OPTS, ...keyboard });
+                await bot.telegram.sendMessage(buf.fromChatId, cfgNow.msg3B || 'Продолжим?', {
+                  reply_markup: { 
+                    remove_keyboard: true,
+                    ...keyboard.reply_markup
+                  },
+                  ...MSG_OPTS
+                });
               }
             }
           } finally {
@@ -948,7 +954,13 @@ bot.telegram.setChatMenuButton({
           [Markup.button.callback(cfg.btnBFreePlacement || 'бесплатное размещение', 'b:freePlacement')],
           [Markup.button.callback(cfg.btnBProceedMedia || 'Отправить медиа', 'b:proceedMedia')]
         ]);
-        await ctx.reply(cfg.msg3B || 'Продолжим?', { ...keyboard, ...MSG_OPTS });
+        await ctx.reply(cfg.msg3B || 'Продолжим?', {
+          reply_markup: { 
+            remove_keyboard: true,
+            ...keyboard.reply_markup
+          },
+          ...MSG_OPTS
+        });
         return;
       }
     }
